@@ -4,6 +4,7 @@ import json
 from dotenv import load_dotenv
 
 from livekit import agents, api
+from livekit.protocol import sip as sip_protocol
 from livekit.agents import AgentSession, Agent, RoomInputOptions
 from livekit.plugins import (
     openai,
@@ -146,10 +147,14 @@ async def entrypoint(ctx: agents.JobContext):
     
     # parse the phone number from the metadata sent by the dispatch script
     phone_number = None
+    sip_headers = None
+    from_number = None
     try:
         if ctx.job.metadata:
             data = json.loads(ctx.job.metadata)
             phone_number = data.get("phone_number")
+            sip_headers = data.get("sip_headers")
+            from_number = data.get("from_number")
     except Exception:
         logger.warning("No valid JSON metadata found. This might be an inbound call.")
 
@@ -162,7 +167,7 @@ async def entrypoint(ctx: agents.JobContext):
         stt=deepgram.STT(model="nova-3", language="multi"),
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=_build_tts(),
-        tools=fnc_ctx.all_tools,
+        tools=fnc_ctx.flatten(),
     )
 
     # Start the session
@@ -187,6 +192,11 @@ async def entrypoint(ctx: agents.JobContext):
                     sip_call_to=phone_number,
                     participant_identity=f"sip_{phone_number}", # Unique ID for the SIP user
                     wait_until_answered=True, # Important: Wait for pickup before continuing
+                    headers=sip_headers or {},
+                    include_headers=sip_protocol.SIP_X_HEADERS,
+                    # Override the caller ID (from number) when provided; otherwise the
+                    # trunk's default number is used.
+                    sip_number=from_number or "",
                 )
             )
             logger.info("Call answered! Agent is now listening.")

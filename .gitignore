@@ -11,3 +11,6 @@ __pycache__/
 # IDE settings
 .vscode/
 .idea/
+
+# SIP packet captures
+*.pcap

@@ -12,7 +12,28 @@ load_dotenv(".env")
 async def main():
     parser = argparse.ArgumentParser(description="Make an outbound call via LiveKit Agent.")
     parser.add_argument("--to", required=True, help="The phone number to call (e.g., +91...)")
+    parser.add_argument(
+        "--from", dest="from_number", default=None, metavar="+E164",
+        help="Override the caller ID (from number). Must be authorized on the trunk. "
+             "Defaults to the trunk's configured number."
+    )
+    parser.add_argument(
+        "--header", action="append", default=[], metavar="KEY=VALUE",
+        help="Custom SIP X-VH-* header to include in the INVITE (repeatable). "
+             "Example: --header X-VH-CorrelationId=abc-123"
+    )
     args = parser.parse_args()
+
+    # Parse --header KEY=VALUE pairs
+    sip_headers = {}
+    for h in args.header:
+        if "=" not in h:
+            print(f"ERROR: --header must be KEY=VALUE, got: {h!r}")
+            return
+        key, _, value = h.partition("=")
+        if not key.startswith("X-VH-"):
+            print(f"WARNING: header {key!r} does not start with 'X-VH-' — Vobiz will drop it")
+        sip_headers[key] = value
 
     # 1. Validation
     phone_number = args.to.strip()
@@ -42,10 +63,16 @@ async def main():
         # 4. Dispatch the Agent
         # We explicitly tell LiveKit to send the 'outbound-caller' agent to this room.
         # We pass the phone number in the 'metadata' field so the agent knows who to dial.
+        metadata = {"phone_number": phone_number}
+        if sip_headers:
+            metadata["sip_headers"] = sip_headers
+        if args.from_number:
+            metadata["from_number"] = args.from_number.strip()
+            
         dispatch_request = api.CreateAgentDispatchRequest(
             agent_name="outbound-caller", # Must match agent.py
             room=room_name,
-            metadata=json.dumps({"phone_number": phone_number})
+            metadata=json.dumps(metadata)
         )
         
         dispatch = await lk_api.agent_dispatch.create_dispatch(dispatch_request)
