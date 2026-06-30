@@ -133,10 +133,40 @@ class OutboundAssistant(Agent):
         )
 
 
+def _log_sip_participant(p) -> None:
+    """Dump everything a (SIP) participant carries — used to discover what
+    Vobiz sends on inbound that we can correlate against the trunk webhook."""
+    attrs = dict(p.attributes or {})
+    logger.info("=" * 70)
+    logger.info("PARTICIPANT JOINED: identity=%s name=%s kind=%s", p.identity, p.name, getattr(p, "kind", "?"))
+    if p.metadata:
+        logger.info("  participant.metadata = %s", p.metadata)
+    # Correlation-relevant SIP attributes first
+    for key in ("sip.callID", "sip.callIDFull", "sip.callStatus", "sip.trunkID",
+                "sip.ruleID", "sip.phoneNumber", "sip.trunkPhoneNumber", "sip.host"):
+        if key in attrs:
+            logger.info("  %-24s = %s", key, attrs[key])
+    # Any mapped SIP headers (require include_headers / headers_to_attributes on the trunk)
+    hdrs = {k: v for k, v in attrs.items() if k.startswith("sip.h.")}
+    if hdrs:
+        logger.info("  --- forwarded SIP headers (sip.h.*) ---")
+        for k, v in hdrs.items():
+            logger.info("  %-24s = %s", k, v)
+    else:
+        logger.info("  (no sip.h.* headers — Vobiz sent none, or trunk include_headers is off)")
+    # Everything else, so nothing is missed
+    other = {k: v for k, v in attrs.items() if not k.startswith("sip.")}
+    if other:
+        logger.info("  --- other attributes ---")
+        for k, v in other.items():
+            logger.info("  %-24s = %s", k, v)
+    logger.info("=" * 70)
+
+
 async def entrypoint(ctx: agents.JobContext):
     """
     Main entrypoint for the agent.
-    
+
     For outbound calls:
     1. Checks for 'phone_number' in the job metadata.
     2. Connects to the room.
@@ -144,6 +174,16 @@ async def entrypoint(ctx: agents.JobContext):
     4. Waits for answer before speaking.
     """
     logger.info(f"Connecting to room: {ctx.room.name}")
+    logger.info("JOB metadata = %r", ctx.job.metadata)
+
+    # Log SIP attributes for any participant that joins (key for inbound correlation)
+    @ctx.room.on("participant_connected")
+    def _on_participant(p):
+        _log_sip_participant(p)
+
+    # Also dump anyone already in the room when we attach
+    for _p in ctx.room.remote_participants.values():
+        _log_sip_participant(_p)
     
     # parse the phone number from the metadata sent by the dispatch script
     phone_number = None
@@ -179,6 +219,20 @@ async def entrypoint(ctx: agents.JobContext):
             close_on_disconnect=True, # Close room when agent disconnects
         ),
     )
+
+    # Participants already present at connect time do NOT fire participant_connected,
+    # so dump them explicitly now (this is the inbound SIP caller).
+    if ctx.room.remote_participants:
+        logger.info("Participants already in room at connect: %d", len(ctx.room.remote_participants))
+        for _p in ctx.room.remote_participants.values():
+            _log_sip_participant(_p)
+    else:
+        logger.info("No participants yet; waiting for one to dump attributes…")
+        try:
+            _p = await ctx.wait_for_participant()
+            _log_sip_participant(_p)
+        except Exception as _e:
+            logger.warning("wait_for_participant failed: %s", _e)
 
     if phone_number:
         logger.info(f"Initiating outbound SIP call to {phone_number}...")
