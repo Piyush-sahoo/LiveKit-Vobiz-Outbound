@@ -62,7 +62,13 @@ for p in ctx.room.remote_participants.values():
 ## How to relate (Vobiz CDR API)
 
 The Vobiz CDR record exposes **`sip_call_id`** — match it against LiveKit's
-`sip.callIDFull`. List CDRs:
+`sip.callIDFull`.
+
+> ✅ **Confirmed:** Vobiz preserves the SIP `Call-ID` end-to-end, so
+> `sip_call_id` **equals** `sip.callIDFull`. The direct match works — no
+> Kamailio or trunk changes needed.
+
+List CDRs:
 
 ```bash
 curl -G "https://api.vobiz.ai/api/v1/Account/{auth_id}/cdr" \
@@ -90,10 +96,11 @@ etc. — everything you need to merge the two call logs.
 
 ---
 
-## If `sip_call_id` doesn't match `sip.callIDFull`
+## Optional: a custom business id
 
-Vobiz runs Kamailio (a B2BUA); if it re-generates the `Call-ID` on the leg to LiveKit,
-`sip_call_id` won't equal `sip.callIDFull`. Then inject your own id on the inbound route:
+The `sip_call_id` ↔ `sip.callIDFull` match is confirmed working, so this is **not
+required**. Use it only if you want a stable id you control (e.g. your own
+campaign/lead id) carried in-session, independent of the SIP Call-ID:
 
 1. Have Kamailio stamp a header on the INVITE to LiveKit, e.g. `X-Vobiz-Call-UUID: <CallUUID>`.
 2. Map it on the **LiveKit inbound trunk** so it lands as an attribute:
