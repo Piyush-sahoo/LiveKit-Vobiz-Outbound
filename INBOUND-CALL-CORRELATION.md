@@ -1,74 +1,54 @@
-# Inbound Call Correlation — LiveKit ↔ Vobiz
+# Correlating Inbound Calls — LiveKit ↔ Vobiz
 
-Tie a **LiveKit** inbound session back to the matching **Vobiz** call record (CDR).
-
----
-
-## What's happening
-
-```
-PSTN caller ──▶ Vobiz (Kamailio) ──INVITE──▶ LiveKit inbound trunk
-                                                   │  dispatch rule
-                                                   ▼
-                                          Room + SIP participant ──▶ Agent
-```
-
-- On **outbound** you originate the leg, so you inject a custom SIP header and Vobiz
-  echoes it — easy correlation.
-- On **inbound** you don't touch the INVITE. The agent job runs with **empty metadata**
-  (`ctx.job.metadata == ''`). Everything you can correlate on lives in the **SIP
-  participant attributes** LiveKit derives from the INVITE Vobiz sends.
+A step-by-step guide to match a **LiveKit** inbound call session with its **Vobiz**
+call record (CDR), so you can join the two logs together.
 
 ---
 
-## What Vobiz sends
+## Overview
 
-On an inbound call, LiveKit surfaces the SIP participant with attributes like:
+On an inbound call, Vobiz routes the caller to your LiveKit agent. The agent receives
+the call as a SIP participant, and LiveKit exposes details about that call as
+**participant attributes**.
 
-```
-PARTICIPANT JOINED: identity=sip_+91XXXXXXXXXX  name="Phone +91XXXXXXXXXX"  kind=SIP
-  sip.callID            = SCL_xxxxxxxxxxxx                       # LiveKit-internal id — do NOT use
-  sip.callIDFull        = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx   # real SIP Call-ID on the wire  ⭐
-  sip.callStatus        = ringing
-  sip.trunkID           = ST_xxxxxxxxxxxx                        # LiveKit inbound trunk
-  sip.ruleID            = SDR_xxxxxxxxxxxx                       # LiveKit dispatch rule
-  sip.phoneNumber       = +91XXXXXXXXXX                         # From (caller)
-  sip.trunkPhoneNumber  = +9180XXXXXXXX                         # To (DID dialed)
-  (no sip.h.* headers — Vobiz forwards no custom headers by default)
-```
+The key field is the **SIP Call-ID**, which both sides share:
 
-`sip.callIDFull` is the SIP `Call-ID` from the INVITE — **this is the join key.**
-(`sip.callID`, the `SCL_…` value, is LiveKit-internal and means nothing to Vobiz.)
+| LiveKit                 | Vobiz CDR      |
+| ----------------------- | -------------- |
+| `sip.callIDFull`        | `sip_call_id`  |
+
+Vobiz preserves the SIP Call-ID end-to-end, so these two values are **equal** — that's
+your join key. No special configuration is required.
 
 ---
 
-## How to capture
+## Step 1 — Capture the Call-ID in your agent
 
-Inbound SIP participants are in the room *before* the agent connects, so
-`participant_connected` does **not** fire for them. Read them after `session.start()`:
+Inbound callers are already in the room when your agent connects, so read the
+participant attributes right after the session starts:
 
 ```python
-await session.start(room=ctx.room, agent=OutboundAssistant(), room_input_options=...)
+await session.start(room=ctx.room, agent=YourAgent(), room_input_options=...)
 
 for p in ctx.room.remote_participants.values():
     attrs = p.attributes or {}
-    sip_call_id = attrs.get("sip.callIDFull")        # ↔ Vobiz CDR sip_call_id
-    caller      = attrs.get("sip.phoneNumber")       # From
-    did         = attrs.get("sip.trunkPhoneNumber")  # To
+    sip_call_id = attrs.get("sip.callIDFull")        # ← join key (the SIP Call-ID)
+    caller      = attrs.get("sip.phoneNumber")       # caller number (From)
+    did         = attrs.get("sip.trunkPhoneNumber")  # number they dialed (To)
+
+    logger.info("inbound call: id=%s from=%s to=%s", sip_call_id, caller, did)
 ```
+
+> Use `sip.callIDFull` (the real SIP Call-ID). Do **not** use `sip.callID` — that is a
+> LiveKit-internal value and will not match Vobiz.
+
+Store `sip_call_id` with your session so you can look it up later.
 
 ---
 
-## How to relate (Vobiz CDR API)
+## Step 2 — Fetch the call record from Vobiz
 
-The Vobiz CDR record exposes **`sip_call_id`** — match it against LiveKit's
-`sip.callIDFull`.
-
-> ✅ **Confirmed:** Vobiz preserves the SIP `Call-ID` end-to-end, so
-> `sip_call_id` **equals** `sip.callIDFull`. The direct match works — no
-> Kamailio or trunk changes needed.
-
-List CDRs:
+Call the Vobiz CDR API for the relevant time window and DID:
 
 ```bash
 curl -G "https://api.vobiz.ai/api/v1/Account/{auth_id}/cdr" \
@@ -81,39 +61,33 @@ curl -G "https://api.vobiz.ai/api/v1/Account/{auth_id}/cdr" \
   -H "X-Auth-Token: {auth_token}"
 ```
 
-In the response `data[]`, find the record where:
-
-```
-record["sip_call_id"] == livekit_attrs["sip.callIDFull"]
-```
-
-That record also gives you `bridge_uuid` (Vobiz call-session UUID), `caller_id_number`,
-`destination_number`, `duration`, `billsec`, `mos`, `jitter`, `cost`, `hangup_cause`,
-etc. — everything you need to merge the two call logs.
-
-**Fallback join** when you only need coarse matching: `caller_id_number` +
-`destination_number` + a `start_time` window.
+Each record in the response `data[]` array includes `sip_call_id` along with call
+details (`caller_id_number`, `destination_number`, `duration`, `billsec`, `mos`,
+`jitter`, `cost`, `hangup_cause`, and more).
 
 ---
 
-## Optional: a custom business id
+## Step 3 — Match the two records
 
-The `sip_call_id` ↔ `sip.callIDFull` match is confirmed working, so this is **not
-required**. Use it only if you want a stable id you control (e.g. your own
-campaign/lead id) carried in-session, independent of the SIP Call-ID:
+Find the CDR whose `sip_call_id` equals the `sip.callIDFull` you captured:
 
-1. Have Kamailio stamp a header on the INVITE to LiveKit, e.g. `X-Vobiz-Call-UUID: <CallUUID>`.
-2. Map it on the **LiveKit inbound trunk** so it lands as an attribute:
+```python
+match = next(
+    (r for r in cdr_response["data"] if r["sip_call_id"] == sip_call_id),
+    None,
+)
+if match:
+    # match["duration"], match["mos"], match["cost"], match["bridge_uuid"], ...
+    ...
+```
 
-   ```python
-   api.SIPInboundTrunkInfo(
-       ...,
-       include_headers=api.SIPHeaderOptions.SIP_X_HEADERS,        # all X-* → sip.h.*, OR:
-       headers_to_attributes={"X-Vobiz-Call-UUID": "vobiz.callUUID"},
-   )
-   ```
+That single record gives you everything you need to merge your LiveKit session with the
+Vobiz call log.
 
-3. Read `attrs["sip.h.x-vobiz-call-uuid"]` (or `attrs["vobiz.callUUID"]`) in the agent.
+---
 
-> `include_headers` on the **outbound** `CreateSIPParticipantRequest` (in `agent.py`)
-> does not affect inbound — it must be set on the **inbound trunk**.
+## Fallback (coarse match)
+
+If you don't have the Call-ID for a given record, you can still approximate a match using
+`caller_id_number` (From) + `destination_number` (To) + a `start_time` window. The
+Call-ID match is exact and preferred.
